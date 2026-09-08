@@ -15,7 +15,10 @@
 // You should have received a copy of the GNU General Public License
 // along with Cumulus. If not, see <https://www.gnu.org/licenses/>.
 
-use super::{resubmission::resolve_session, CollatorMessage};
+use super::{
+	resubmission::{resolve_session, sign_scheduling_info},
+	CollatorMessage,
+};
 use crate::{
 	collator::{self as collator_util, BuildBlockAndImportParams, Collator, SlotClaim},
 	collators::{
@@ -40,12 +43,14 @@ use cumulus_client_resubmission_store::prepare_resubmission_aux_data;
 use cumulus_primitives_aura::{AuraUnincludedSegmentApi, Slot};
 use cumulus_primitives_core::{
 	BlockBundleInfo, ClaimQueueOffset, CoreInfo, CoreSelector, CumulusDigestItem,
-	PersistedValidationData, RelayBlockIdentifier, RelayParentOffsetApi, SchedulingProof,
-	SchedulingV3EnabledApi, TargetBlockRate,
+	PersistedValidationData, RelayBlockIdentifier, RelayParentOffsetApi, SchedulingInfoPayload,
+	SchedulingProof, SchedulingV3EnabledApi, TargetBlockRate,
 };
 use cumulus_relay_chain_interface::RelayChainInterface;
 use futures::prelude::*;
-use polkadot_primitives::{Block as RelayBlock, CoreIndex, Header as RelayHeader, Id as ParaId};
+use polkadot_primitives::{
+	ApprovedPeerId, Block as RelayBlock, CoreIndex, Header as RelayHeader, Id as ParaId,
+};
 use sc_client_api::{backend::AuxStore, BlockBackend, BlockOf, UsageProvider};
 use sc_consensus::BlockImport;
 use sc_consensus_aura::SlotDuration;
@@ -882,6 +887,7 @@ where
 					para_slot: cx.para_slot.slot,
 					para_client: &*env.para_client,
 					v3_enabled: cx.v3_enabled,
+					keystore: &env.keystore,
 				})
 				.await
 				{
@@ -937,6 +943,7 @@ struct BuildCollationParams<
 	para_slot: cumulus_primitives_aura::Slot,
 	para_client: &'a Client,
 	v3_enabled: bool,
+	keystore: &'a KeystorePtr,
 }
 
 /// Build a collation for one core.
@@ -978,6 +985,7 @@ async fn build_collation_for_core<
 		para_slot,
 		para_client,
 		v3_enabled,
+		keystore,
 	}: BuildCollationParams<'_, Block, P, RelayClient, BI, CIDP, Proposer, CS, CHP, Client>,
 ) -> Result<Option<Block::Header>, ()>
 where
@@ -1026,14 +1034,31 @@ where
 			"Building V3 collation with scheduling proof",
 		);
 
-		scheduling_proof = Some(SchedulingProof {
-			header_chain,
-			// Initial submission: internal_scheduling_parent == relay_parent, so the
-			// internal scheduling parent header is the relay parent's header itself.
-			internal_scheduling_parent_header: relay_parent_header.clone(),
-			// Initial submission: no signature needed, core selection from UMP signals
-			signed_scheduling_info: None,
-		});
+		// `internal_scheduling_parent == relay_parent`, so the internal scheduling parent
+		// header is the relay parent's header itself.
+		scheduling_proof =
+			ApprovedPeerId::try_from(collator_peer_id.to_bytes()).ok().and_then(|peer_id| {
+				let signed = sign_scheduling_info::<P>(
+					SchedulingInfoPayload::new(
+						core_info.selector,
+						core_info.claim_queue_offset.0,
+						peer_id,
+						relay_parent_header.hash(),
+					),
+					slot_claim.author_pub(),
+					keystore,
+				)?;
+
+				Some(SchedulingProof::new(header_chain, relay_parent_header.clone(), Some(signed)))
+			});
+		if scheduling_proof.is_none() {
+			tracing::warn!(
+				target: LOG_TARGET,
+				?core_index,
+				"Skipping core: cannot build signed V3 scheduling proof.",
+			);
+			return Ok(None);
+		}
 	}
 
 	let Some(validation_code_hash) = code_hash_provider.code_hash_at(pov_parent_hash) else {
